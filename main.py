@@ -473,14 +473,8 @@ def forecast_case(case, name):
             sigma = 0.5
             slo = shi = None
         else:
-            a, b = ab[h]
-            sh, uh = _s(h), _u(h)
-            lr = a + b * ln_p1 + sum(
-                theta[i] * sh2 * ft2 for (i, sh2, ft2)
-                in _theta_terms(h, f_t, vpc_t - med_vpc, ln_p1, med_x))
-            resid = [y - (a + b * x + sum(
-                theta[i] * sh2 * ft2 for (i, sh2, ft2)
-                in _theta_terms(h, f, va, x, med_x)))
+            lr = _predict_lr(h, ab, theta, ln_p1, f_t, vpc_t - med_vpc, med_x)
+            resid = [y - _predict_lr(h, ab, theta, x, f, va, med_x)
                      for (x, y, f, va, _di) in pts]
             sigma = max(SIGMA_FLOOR, _pstdev(resid) * SIGMA_MULT)
             slo = shi = None
