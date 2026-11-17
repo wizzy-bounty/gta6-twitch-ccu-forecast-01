@@ -1,8 +1,9 @@
-"""Forecast GTA VI launch-day Twitch CCU, hour by hour.
+"""Forecast GTA VI launch-day Twitch CCU, hour by hour (v5).
 
 Donor-curve log-ratio model: for each forecast hour h = 2..24,
     ln(y_h / p1) = a_h + b_h * ln(p1) + c * s(h) * f
                    + g * u(h) * (vpc1 - med_vpc1)
+                   + e * u(h) * f * (ln(p1) - med_ln_p1)
 with noise ~ N(0, sigma_h). All coefficients are fit per case from the
 comparable launches shipped in the case file itself -- no hard-coded curve.
 
@@ -11,7 +12,21 @@ comparable launches shipped in the case file itself -- no hard-coded curve.
 - vpc1 is viewer concentration: ln(hour-1 viewers / hour-1 channels).
   Its effect is a single global parameter g, active only in the early
   trough (u(h) = 1 for h <= 4, 0.5 for h == 5, 0 after).
-- (c, g) are fit together by alternating least squares (8 rounds).
+- The v5 addition is the f x size interaction e: the momentum effect in
+  the trough depends on launch size (ln(p1) centred on the donors'
+  median), also on the trough shape u(h). (c, g, e) are fit together by
+  alternating least squares (8 rounds).
+- sigma_h is NOT the in-sample residual spread: it is the spread of
+  internal leave-one-out residuals (refit without each donor, predict
+  that donor), times 0.58 and floored at 0.30. LOO residuals are the
+  honest dispersion of the median forecast; the 0.58/0.30 calibration
+  was chosen on the practice cases with the LOO guardrail held flat.
+
+Local verification (harness-local/eval.py): practice 3-case (p00/p02/p03)
+0.1389 (p00 0.1493 / p02 0.0991 / p03 0.1682; 4-case incl. p01: 0.1352),
+LOO 19 donors 0.2510, vs v2 0.1574 / 0.2512 and v3 0.1548 / 0.2491.
+Margins are thin (practice gate 0.139, LOO gate 0.2512) and most of the
+practice gain is sigma-side; LOO is slightly worse than v3's.
 
 Python 3.13 stdlib only, no network, deterministic.
 """
@@ -31,6 +46,17 @@ B_MAX = 0.05
 ALS_ROUNDS = 8
 C_INIT = 0.5
 G_INIT = 0.0
+# v5 interaction switches (0=off, 1=on). INT_FVPC: d*s(h)*f*(vpc1-med_vpc);
+# INT_FSIZE: e*s(h)*f*(lnp1-med_lnp1). *_SHAPE: 's' (momentum) or 'u' (trough).
+INT_FVPC = 0
+INT_FVPC_SHAPE = "s"
+INT_FSIZE = 1
+INT_FSIZE_SHAPE = "u"
+# v5 angle 3: sigma from internal leave-one-out residuals (not in-sample).
+LOO_SIGMA = 1
+LOO_SIGMA_MULT = 0.58
+LOO_SIGMA_FLOOR = 0.30
+LOO_ASYM = 0  # 1 = separate lower/upper sigma from LOO residual halves
 
 
 def _median(vals):
@@ -192,11 +218,12 @@ def _round_half_up_2dp(v):
     return math.floor(v * 100.0 + 0.5) / 100.0
 
 
-def _quantile_row(h, lr, sigma, p1):
+def _quantile_row(h, lr, sigma, p1, sigma_lo=None):
     qs = []
     prev = None
     for z in Z:
-        q = p1 * math.exp(lr + z * sigma)
+        s = sigma_lo if (sigma_lo is not None and z < 0) else sigma
+        q = p1 * math.exp(lr + z * s)
         if q > 1e9:
             q = 1e9
         q = _round_half_up_2dp(q)
@@ -209,21 +236,34 @@ def _quantile_row(h, lr, sigma, p1):
     return {"hour": h, "q": qs}
 
 
-def _fit_ab(hour_data, c, g):
-    """Per-hour (a_h, b_h) with the current (c, g).
+def _theta_terms(h, f, va, x, med_x):
+    """(coefficient, shape, feature) triples of the active global terms."""
+    terms = [(0, _s(h), f), (1, _u(h), va)]
+    if INT_FVPC:
+        sh = _s(h) if INT_FVPC_SHAPE == "s" else _u(h)
+        terms.append((len(terms), sh, f * va))
+    if INT_FSIZE:
+        sh = _s(h) if INT_FSIZE_SHAPE == "s" else _u(h)
+        terms.append((len(terms), sh, f * (x - med_x)))
+    return terms
 
-    Regress the log-ratio net of the momentum and vpc1 effects on
-    ln(p1); clamp the slope to [-0.55, 0.05], then refit the intercept
-    as the mean residual after clamping. Hours with fewer than 5
-    donors are left out (they use the median fallback instead).
+
+def _fit_ab(hour_data, theta, med_x=0.0):
+    """Per-hour (a_h, b_h) with the current global theta vector.
+
+    Regress the log-ratio net of all global effects on ln(p1); clamp
+    the slope to [-0.55, 0.05], then refit the intercept as the mean
+    residual after clamping. Hours with fewer than 5 donors are left
+    out (they use the median fallback instead).
     """
     ab = {}
     for h, pts in hour_data.items():
         if len(pts) < 5:
             continue
-        sh, uh = _s(h), _u(h)
-        xs = [x for (x, _y, _f, _va) in pts]
-        ys = [y - c * sh * f - g * uh * va for (x, y, f, va) in pts]
+        xs = [x for (x, _y, _f, _va, _di) in pts]
+        ys = [y - sum(theta[i] * sh * ft for (i, sh, ft)
+                      in _theta_terms(h, f, va, x, med_x))
+              for (x, y, f, va, _di) in pts]
         mx = sum(xs) / len(xs)
         my = sum(ys) / len(ys)
         var = sum((x - mx) ** 2 for x in xs)
@@ -237,34 +277,114 @@ def _fit_ab(hour_data, c, g):
     return ab
 
 
-def _solve_cg(hour_data, ab):
-    """Joint 2x2 least squares for (c, g) from all residuals.
+def _solve_lin(A, b):
+    """Dense Gaussian elimination with partial pivoting (K <= 4 here)."""
+    n = len(b)
+    M = [row[:] + [b[i]] for i, row in enumerate(A)]
+    for col in range(n):
+        piv = max(range(col, n), key=lambda r: abs(M[r][col]))
+        if abs(M[piv][col]) < 1e-12:
+            return [0.0] * n
+        M[col], M[piv] = M[piv], M[col]
+        for r in range(n):
+            if r != col and M[r][col] != 0.0:
+                fac = M[r][col] / M[col][col]
+                for cc in range(col, n + 1):
+                    M[r][cc] -= fac * M[col][cc]
+    return [M[i][n] / M[i][i] for i in range(n)]
 
-    Residuals r = y - a_h - b_h * ln(p1); solve for c, g in
-    r ~= c * s(h) * f + g * u(h) * (vpc1 - med_vpc1). Singular
-    systems yield (0.0, 0.0).
+
+def _solve_cg(hour_data, ab, med_x=0.0):
+    """Joint KxK least squares for the global theta from all residuals.
+
+    Residuals r = y - a_h - b_h * ln(p1); solve for theta in
+    r ~= sum_i theta_i * shape_i(h) * feat_i. Singular systems yield
+    a zero vector.
     """
-    ss = su = uu = sr = ur = 0.0
+    k = 2 + (1 if INT_FVPC else 0) + (1 if INT_FSIZE else 0)
+    A = [[0.0] * k for _ in range(k)]
+    bb = [0.0] * k
     for h, pts in hour_data.items():
         if h not in ab:
             continue
         a, b = ab[h]
-        sh, uh = _s(h), _u(h)
-        for (x, y, f, va) in pts:
+        for (x, y, f, va, _di) in pts:
             r = y - a - b * x
-            st = sh * f
-            ut = uh * va
-            ss += st * st
-            su += st * ut
-            uu += ut * ut
-            sr += st * r
-            ur += ut * r
-    det = ss * uu - su * su
-    if abs(det) < 1e-12:
-        return 0.0, 0.0
-    c = (sr * uu - ur * su) / det
-    g = (ss * ur - su * sr) / det
-    return c, g
+            cols = [sh * ft for (_i, sh, ft)
+                    in _theta_terms(h, f, va, x, med_x)]
+            for i in range(k):
+                bb[i] += cols[i] * r
+                for j in range(k):
+                    A[i][j] += cols[i] * cols[j]
+    return _solve_lin(A, bb)
+
+
+def _fit_model(hour_data, med_x):
+    """ALS fit of (ab, theta) on one hour_data dict."""
+    theta = [C_INIT, G_INIT]
+    if INT_FVPC:
+        theta.append(0.0)
+    if INT_FSIZE:
+        theta.append(0.0)
+    ab = {}
+    for _ in range(ALS_ROUNDS):
+        ab = _fit_ab(hour_data, theta, med_x)
+        theta = _solve_cg(hour_data, ab, med_x)
+    return ab, theta
+
+
+def _predict_lr(h, ab, theta, x, f, va, med_x):
+    """Median log-ratio for one hour from a fitted model."""
+    a, b = ab[h]
+    return a + b * x + sum(theta[i] * sh * ft for (i, sh, ft)
+                           in _theta_terms(h, f, va, x, med_x))
+
+
+def _loo_sigmas(hour_data, feats, med_vpc, med_x, hours):
+    """Per-hour sigma from internal leave-one-out residuals.
+
+    For each donor i: refit without i, predict i's own log-ratios, record
+    residual (truth - prediction) per hour. sigma_h = pstdev of those
+    residuals (fallback: in-sample residual pstdev when < 5 points).
+    Asymmetric variant: RMS of the negative half / positive half, each
+    shrunk 50% toward the pooled pstdev (few points per hour).
+    Returns {h: (sigma_lo, sigma_hi)}.
+    """
+    resid = {h: [] for h in hours}
+    nd = len(feats)
+    for di in range(nd):
+        sub = {h: [p for p in pts if p[4] != di]
+               for h, pts in hour_data.items()}
+        ab_i, theta_i = _fit_model(sub, med_x)
+        x_i, curve_i, f_i, vpc_i = feats[di]
+        xs_i = [ft[0] for ft in feats if ft is not feats[di]]
+        lo_i, hi_i = min(xs_i), max(xs_i)
+        xw = min(max(x_i, lo_i), hi_i)
+        va_i = vpc_i - med_vpc
+        for h in hours:
+            if h not in ab_i or h not in curve_i:
+                continue
+            y = math.log(curve_i[h] / curve_i[1])
+            lr = _predict_lr(h, ab_i, theta_i, xw, f_i, va_i, med_x)
+            resid[h].append(y - lr)
+    out = {}
+    for h in hours:
+        rs = resid[h]
+        if len(rs) >= 5:
+            sd = _pstdev(rs)
+            if LOO_ASYM:
+                neg = [r for r in rs if r < 0]
+                pos = [r for r in rs if r >= 0]
+                rms_neg = math.sqrt(sum(r * r for r in neg) / len(neg)) if neg else sd
+                rms_pos = math.sqrt(sum(r * r for r in pos) / len(pos)) if pos else sd
+                slo = 0.5 * rms_neg + 0.5 * sd
+                shi = 0.5 * rms_pos + 0.5 * sd
+                out[h] = (slo, shi)
+            else:
+                out[h] = (sd, sd)
+        else:
+            out[h] = (None, None)
+    return out
 
 
 def forecast_case(case, name):
@@ -334,32 +454,46 @@ def forecast_case(case, name):
     hour_data = {}
     for h in hours:
         pts = []
-        for (x, curve, f, vpc) in feats:
+        for di, (x, curve, f, vpc) in enumerate(feats):
             if h in curve:
-                pts.append((x, math.log(curve[h] / curve[1]), f, vpc - med_vpc))
+                pts.append((x, math.log(curve[h] / curve[1]), f, vpc - med_vpc, di))
         hour_data[h] = pts
 
-    # Alternating least squares for (c, g): 8 rounds from (0.5, 0.0).
-    c, g = C_INIT, G_INIT
-    ab = {}
-    for _ in range(ALS_ROUNDS):
-        ab = _fit_ab(hour_data, c, g)
-        c, g = _solve_cg(hour_data, ab)
+    # Alternating least squares for theta.
+    med_x = _median([ft[0] for ft in feats])
+    ab, theta = _fit_model(hour_data, med_x)
+    c, g = theta[0], theta[1]
+    loo_sig = _loo_sigmas(hour_data, feats, med_vpc, med_x, hours) if LOO_SIGMA else None
 
     out_hours = []
     for h in hours:
         pts = hour_data[h]
         if len(pts) < 5:
-            lr = _median([y for (_x, y, _f, _va) in pts]) if pts else 0.0
+            lr = _median([y for (_x, y, _f, _va, _di) in pts]) if pts else 0.0
             sigma = 0.5
+            slo = shi = None
         else:
             a, b = ab[h]
             sh, uh = _s(h), _u(h)
-            lr = a + b * ln_p1 + c * sh * f_t + g * uh * (vpc_t - med_vpc)
-            resid = [y - (a + b * x + c * sh * f + g * uh * va)
-                     for (x, y, f, va) in pts]
+            lr = a + b * ln_p1 + sum(
+                theta[i] * sh2 * ft2 for (i, sh2, ft2)
+                in _theta_terms(h, f_t, vpc_t - med_vpc, ln_p1, med_x))
+            resid = [y - (a + b * x + sum(
+                theta[i] * sh2 * ft2 for (i, sh2, ft2)
+                in _theta_terms(h, f, va, x, med_x)))
+                     for (x, y, f, va, _di) in pts]
             sigma = max(SIGMA_FLOOR, _pstdev(resid) * SIGMA_MULT)
-        out_hours.append(_quantile_row(h, lr, sigma, p1))
+            slo = shi = None
+            if loo_sig is not None:
+                lslo, lshi = loo_sig[h]
+                if lslo is not None:
+                    slo = max(LOO_SIGMA_FLOOR, lslo * LOO_SIGMA_MULT)
+                    shi = max(LOO_SIGMA_FLOOR, lshi * LOO_SIGMA_MULT)
+                    sigma = shi
+        if slo is not None and LOO_ASYM:
+            out_hours.append(_quantile_row(h, lr, sigma, p1, sigma_lo=slo))
+        else:
+            out_hours.append(_quantile_row(h, lr, sigma, p1))
     return {"hours": out_hours}
 
 
