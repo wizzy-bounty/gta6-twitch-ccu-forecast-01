@@ -183,12 +183,17 @@ def fit(donors: list, p1: float) -> dict:
     return out
 
 
+def quantile_row(p1: float, lr: float, sigma: float, z: float) -> float:
+    """One raw quantile value, before clamping and rounding."""
+    return p1 * math.exp(lr + z * sigma)
+
+
 def hour_quantiles(p1: float, lr: float, sigma: float) -> list:
     """The five quantiles for one hour, non-decreasing, in (0, 1e9]."""
     row = []
     prev = 0.0
     for z in Z:
-        q = p1 * math.exp(lr + z * sigma)
+        q = quantile_row(p1, lr, sigma, z)
         q = max(q, prev)
         q = min(q, 1e9)
         q = round2(q)
