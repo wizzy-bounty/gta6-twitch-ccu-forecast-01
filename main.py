@@ -1,102 +1,68 @@
-"""GTA VI Twitch CCU forecast v2: size-aware launch curve with early-wave momentum.
+"""Forecast GTA VI launch-day Twitch CCU, hour by hour.
 
-Model (computed at run time from the case's own comparables, no hard-coded
-curve): for each forecast hour h = 2..24, the log ratio of that hour's
-viewers to hour 1's print is
+Donor-curve log-ratio model: for each forecast hour h = 2..24,
+    ln(y_h / p1) = a_h + b_h * ln(p1) + c * s(h) * f
+                   + g * u(h) * (vpc1 - med_vpc1)
+with noise ~ N(0, sigma_h). All coefficients are fit per case from the
+comparable launches shipped in the case file itself -- no hard-coded curve.
 
-    ln(y_h / p1) = a_h + b_h * ln(p1) + c * s(h) * f + noise,
-    noise ~ N(0, sigma_h),
+- f is the early-wave momentum: log of the mean of the last 3 hourly
+  points in the 13 hours before the checkpoint, over the hour-1 print.
+- vpc1 is viewer concentration: ln(hour-1 viewers / hour-1 channels).
+  Its effect is a single global parameter g, active only in the early
+  trough (u(h) = 1 for h <= 4, 0.5 for h == 5, 0 after).
+- (c, g) are fit together by alternating least squares (8 rounds).
 
-fit by least squares over the donor launches, with the size slope b_h
-clamped to [-0.55, 0.05] and the intercept refit after clamping. The size
-term is the first edge: across past launches the day's peak-to-hour-1 ratio
-falls steeply as hour 1 grows (correlation of ln(p1) with ln(peak/p1) is
-about -0.82 over the donors), so a small hour-1 print predicts a steep
-all-day ramp and a huge one predicts a nearly flat day.
-
-The second edge is the early-wave momentum f. The game unlocks at rolling
-local midnight, so by the checkpoint (the end of hour 1) it has already been
-live for ~14 hours in New Zealand / Australia and ~2 hours in central
-Europe. f measures how hot that early wave was running into hour 1:
-
-    f = ln(mean of the last 3 hourly points in the 13 hours before the
-           checkpoint, divided by p1),
-
-the last three points being the 22:00 and 23:00 UTC hours of the previous
-day and hour 1 itself. A launch whose early wave ran hot stays hot: the
-fitted effect is negative in the small hours (a hot early wave mean-reverts
-into a deeper trough at hours 2-4) and about +1.0 from the early afternoon
-on (a hot early wave carries into a higher evening peak). One global scale
-c carries that effect through a fixed shape s(h) -- -0.55 at hours 2-4,
-0 at hour 5, ramping linearly to 1.0 at hour 13 and flat after -- instead
-of 23 free per-hour coefficients, so the momentum term cannot overfit the
-nineteen donors. a_h, b_h and the single c are fit by alternating least
-squares (8 rounds, started at c = 0.5); sigma_h is the residual standard
-deviation of the full fit, times 0.9 and floored at 0.15. ln(p1) is
-winsorised to the donors' range so an unprecedented hour-1 print never
-extrapolates the line.
-
-Donors are the case's comparables that are real launches of the same kind:
-tier "comparable" in their unlock note, with a live hour 1 (hour-1 viewers
-at least 3% of that launch's release-day peak, which drops simultaneous-
-global launches whose hour 1 was still pre-unlock trickle, early-access-
-contaminated and weak launches, and GTA VI's own pre-release category
-history). Fallbacks relax the filters if too few donors survive, and with
-no donors at all the forecast degrades to the house persistence shape.
-
-Quantiles: q_tau(h) = p1 * exp(a_h + b_h*ln(p1) + c*s(h)*f + z_tau*sigma_h),
-rounded half-up to 2 decimals, z = (-1.645, -0.674, 0, 0.674, 1.645).
-
-Practice (ground truth = SullyGnome hourly averages, the same source the
-kit was cut from; RDR2's month could not be re-read, so p01 is not scored
-here): mean pinball loss 0.157 over Wolverine / God of War Ragnarok /
-Spider-Man 2 (v1, size-only: 0.187), against the house baseline's 0.421 on
-the same three cases; 90% coverage 0.90 on average. Leave-one-out over the
-19 donors: 0.251 against the baseline's 0.403 (v1: 0.261). Deterministic,
-Python 3.13 standard library only, no network.
+Python 3.13 stdlib only, no network, deterministic.
 """
-
 import json
 import math
 import os
 import sys
-from datetime import date, timedelta
+from datetime import datetime
 from pathlib import Path
 
-# The grader's -P leaves /bot off sys.path: put it back first, so a module
-# shipped beside this file imports.
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
-
-# The quantile levels the contest scores, in the order each row lists them.
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# The standard normal's quantile at each level.
-Z = [-1.645, -0.674, 0, 0.674, 1.645]
-
-# Donor filters.
-MIN_LIVE_HOUR1 = 0.03   # hour-1 viewers as a share of the launch's day peak
-MIN_DONORS = 8           # below this, relax the live-hour-1 filter
-MIN_DONORS_HARD = 5      # below this, relax the tier filter too
-MIN_PER_HOUR = 5         # donors needed for an hour's own fit
-SIGMA_FLOOR = 0.15       # never claim an hour more precisely than this (log)
-SIGMA_MULT = 0.9         # residual std is slightly wide; shrink it a touch
-B_MIN, B_MAX = -0.55, 0.05  # clamp on the size slope
-
-# Early-wave momentum: the hours before the checkpoint that the feature
-# averages, and the shape of its effect over the forecast day. The shape
-# is fixed, not fitted: a hot early wave mean-reverts into the small-hours
-# trough, is neutral at the US-East unlock hour, then carries one-for-one
-# into the evening peak.
-WINDOW_HOURS = 13       # window before day_start holding the early wave
-FEATURE_POINTS = 3      # last hourly points of the window the feature averages
-MOMENTUM_ROUNDS = 8     # alternating least-squares rounds for the global scale
-MOMENTUM_START = 0.5    # starting value of the global momentum scale
+Z = (-1.645, -0.674, 0.0, 0.674, 1.645)
+SIGMA_FLOOR = 0.15
+SIGMA_MULT = 0.9
+B_MIN = -0.55
+B_MAX = 0.05
+ALS_ROUNDS = 8
+C_INIT = 0.5
+G_INIT = 0.0
 
 
-def momentum_shape(h: int) -> float:
-    """s(h): the fixed shape of the early-wave effect over the forecast day."""
+def _median(vals):
+    """Median of a non-empty sequence (mean of the two middles if even)."""
+    s = sorted(vals)
+    n = len(s)
+    mid = n // 2
+    if n % 2:
+        return s[mid]
+    return (s[mid - 1] + s[mid]) / 2.0
+
+
+def _pstdev(vals):
+    """Population standard deviation of a non-empty sequence."""
+    n = len(vals)
+    mean = sum(vals) / n
+    return math.sqrt(sum((v - mean) ** 2 for v in vals) / n)
+
+
+def _ts_hour(ts):
+    """Absolute hour index of an ISO-8601 UTC timestamp, or None."""
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return int(dt.timestamp() // 3600)
+
+
+def _s(h):
+    """Momentum shape: negative in the trough, rising to 1 by hour 13."""
     if h <= 4:
         return -0.55
     if h == 5:
@@ -106,313 +72,308 @@ def momentum_shape(h: int) -> float:
     return (h - 5) / 8.0
 
 
-def round2(x: float) -> float | int:
-    """x rounded to 2 decimals, half up, as JavaScript's Math.round(x * 100) / 100."""
-    scaled = x * 100
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 100
-    return int(value) if value.is_integer() else value
+def _u(h):
+    """vpc1 trough shape: full effect hours <= 4, half at hour 5, none after."""
+    if h <= 4:
+        return 1.0
+    if h == 5:
+        return 0.5
+    return 0.0
 
 
-def mean(xs):
-    return sum(xs) / len(xs)
+def release_day(comp):
+    """Release-day curve {hour: viewers} of one comparable.
 
-
-def pstdev(xs):
-    m = mean(xs)
-    return math.sqrt(sum((x - m) ** 2 for x in xs) / len(xs))
-
-
-def median(xs):
-    s = sorted(xs)
-    n = len(s)
-    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
-
-
-def hour_key(stamp: str) -> int | None:
-    """An hourly row's `from` stamp as an absolute hour index, or None.
-
-    Only the date and the hour are used, so a trailing Z or offset cannot
-    shift the result.
+    Rows are the comparable's hourly rows on the UTC date of day_start;
+    hour = UTC hour + 1. Rows without viewers are skipped. A curve
+    without hour 1 is not usable, so None is returned for it.
     """
-    if len(stamp) < 13:
-        return None
-    try:
-        d = date(int(stamp[0:4]), int(stamp[5:7]), int(stamp[8:10]))
-        return d.toordinal() * 24 + int(stamp[11:13])
-    except ValueError:
-        return None
-
-
-def release_day(comp: dict) -> dict | None:
-    """{hour 1..24: viewers} for the comparable's release day, or None.
-
-    A launch's release day is the UTC date of its day_start; an hour's point
-    is the row whose `from` falls in that hour. Rows with no viewers are
-    skipped (SullyGnome samples small categories sparsely).
-    """
-    day = comp.get("day_start", "")[:10]
+    day = (comp.get("day_start") or "")[:10]
     if not day:
         return None
-    out = {}
+    curve = {}
     for row in comp.get("hourly") or []:
-        frm = row.get("from", "")
+        frm = row.get("from") or ""
         if frm[:10] != day:
             continue
-        viewers = row.get("viewers")
-        if not viewers:
+        v = row.get("viewers")
+        if v is None or v <= 0:
             continue
-        hour = int(frm[11:13]) + 1
-        if 1 <= hour <= 24:
-            out[hour] = viewers
-    if 1 not in out:
+        curve[int(frm[11:13]) + 1] = float(v)
+    if 1 not in curve:
         return None
-    return out
+    return curve
 
 
-def hourly_points(rows: list | None) -> list:
-    """(hour index, viewers) pairs from hourly rows, oldest first."""
-    pts = []
-    for row in rows or []:
-        key = hour_key(row.get("from", ""))
-        viewers = row.get("viewers")
-        if key is not None and viewers:
-            pts.append((key, viewers))
-    pts.sort()
-    return pts
+def _is_live(curve):
+    """Live hour-1: hour-1 viewers at least 3% of the day's peak."""
+    return curve[1] >= 0.03 * max(curve.values())
 
 
-def window_feature(hourly_rows: list | None, day_start: str,
-                   checkpoint: str, p1: float) -> float | None:
-    """Early-wave momentum f for one launch, or None if its window is empty.
-
-    The window is the 13 hours before the checkpoint: the rolling-midnight
-    unlock wave (New Zealand first) up to and including hour 1. f is the
-    log of the mean of the window's last three hourly points over the
-    hour-1 print. With fewer than three points the mean of what is there
-    is used; with none the feature is undefined and the caller falls back
-    to the donors' median.
-    """
-    start = hour_key(day_start)
-    end = hour_key(checkpoint)
-    if start is None or end is None:
-        return None
-    pts = [(k, v) for k, v in hourly_points(hourly_rows)
-           if start - WINDOW_HOURS <= k < end]
-    if not pts:
-        return None
-    last = [v for _, v in pts[-FEATURE_POINTS:]]
-    return math.log(mean(last) / max(p1, 1))
-
-
-def is_donor(comp: dict, curve: dict, live: bool) -> bool:
-    """Tier + (optionally) live-hour-1 filter. Never the target's own history."""
-    name = comp.get("name", "")
-    if "Grand Theft Auto VI" in name:
+def is_donor(comp, curve, live=True):
+    """Donor filters: not GTA VI itself, Tier: comparable, and (when
+    live=True) a live hour 1."""
+    if "Grand Theft Auto VI" in (comp.get("name") or ""):
         return False
-    unlock = comp.get("unlock", "")
-    if "Tier: comparable" not in unlock:
+    if "Tier: comparable" not in (comp.get("unlock") or ""):
         return False
-    if live and curve[1] < MIN_LIVE_HOUR1 * max(curve.values()):
+    if live and not _is_live(curve):
         return False
     return True
 
 
-def pick_donors(case: dict) -> list:
-    """Donor (comparable, curve) pairs, filters relaxed if too few survive."""
+def pick_donors(case):
+    """Donor list [(comp, curve)] with the spec's relaxations.
+
+    Live donors (all three filters) when there are at least 8; else drop
+    the live filter (need >= 5); else drop the tier filter but keep live
+    (need >= 5); else every parsed comparable except GTA VI.
+    """
     parsed = []
     for comp in case.get("comparables") or []:
         curve = release_day(comp)
         if curve is not None:
             parsed.append((comp, curve))
-    live = [(comp, c) for comp, c in parsed if is_donor(comp, c, live=True)]
-    if len(live) >= MIN_DONORS:
+    live = [(c, cv) for c, cv in parsed if is_donor(c, cv, live=True)]
+    if len(live) >= 8:
         return live
-    tiered = [(comp, c) for comp, c in parsed if is_donor(comp, c, live=False)]
-    if len(tiered) >= MIN_DONORS_HARD:
-        return tiered
-    any_live = [(comp, c) for comp, c in parsed
-                if "Grand Theft Auto VI" not in comp.get("name", "")
-                and c[1] >= MIN_LIVE_HOUR1 * max(c.values())]
-    if len(any_live) >= MIN_DONORS_HARD:
-        return any_live
-    return parsed
+    tier = [(c, cv) for c, cv in parsed if is_donor(c, cv, live=False)]
+    if len(tier) >= 5:
+        return tier
+    liveish = [(c, cv) for c, cv in parsed
+               if "Grand Theft Auto VI" not in (c.get("name") or "")
+               and _is_live(cv)]
+    if len(liveish) >= 5:
+        return liveish
+    return [(c, cv) for c, cv in parsed
+            if "Grand Theft Auto VI" not in (c.get("name") or "")]
 
 
-def donor_momentum(comp: dict, curve: dict) -> float | None:
-    """A donor's early-wave momentum, from its own hourly rows."""
-    day_start = comp.get("day_start", "")
-    if not day_start:
-        return None
-    start = hour_key(day_start)
-    if start is None:
-        return None
-    # The donor's checkpoint is one hour after its day starts.
-    checkpoint = f"{day_start[:10]}T01:00:00Z"
-    return window_feature(comp.get("hourly"), day_start, checkpoint, curve[1])
+def _momentum(rows, day_start, checkpoint, p1):
+    """Early-wave momentum f from hourly (hour_index, viewers) rows.
 
-
-def _fit_size_given_scale(per_hour, scale):
-    """Per-hour size regression given the momentum scale.
-
-    Returns {hour: (a, b)}: the intercept and clamped size slope from
-    regressing the scale-adjusted log ratios on ln(p1).
+    Window: the 13 hours before the checkpoint, i.e. hour indices in
+    [hour(day_start) - 13, hour(checkpoint)). f is the log of the mean
+    of the last 3 hourly points in the window over p1. None when the
+    window is empty or the mean is not positive.
     """
-    coefs = {}
-    for h in range(2, 25):
-        pts = per_hour[h]
-        if len(pts) < 2:
-            coefs[h] = (median([p[2] for p in pts]) if pts else 0.0, 0.0)
-            continue
-        adj = [(xx, y - scale * momentum_shape(h) * f)
-               for xx, f, y in pts]
-        mx, my = mean([p[0] for p in adj]), mean([p[1] for p in adj])
-        var = sum((p[0] - mx) ** 2 for p in adj) / len(adj)
-        b = (sum((p[0] - mx) * (p[1] - my) for p in adj) / len(adj) / var
-             if var > 0 else 0.0)
-        b = max(B_MIN, min(B_MAX, b))
-        a = mean([y - b * xx for xx, y in adj])
-        coefs[h] = (a, b)
-    return coefs
+    start = _ts_hour(day_start)
+    end = _ts_hour(checkpoint)
+    if start is None or end is None:
+        return None
+    start -= 13
+    pts = sorted((idx, v) for idx, v in rows
+                 if idx is not None and v is not None and start <= idx < end)
+    if not pts:
+        return None
+    last = pts[-3:]
+    mean = sum(v for _, v in last) / len(last)
+    if mean <= 0 or p1 <= 0:
+        return None
+    return math.log(mean / p1)
 
 
-def _fit_scale(per_hour, coefs):
-    """One global momentum scale by least squares given the per-hour fits."""
-    num = 0.0
-    den = 0.0
-    for h in range(2, 25):
-        a, b = coefs[h]
-        for xx, f, y in per_hour[h]:
-            shape = momentum_shape(h)
-            num += shape * f * (y - (a + b * xx))
-            den += (shape * f) ** 2
-    return num / den if den > 0 else 0.0
+def _donor_vpc1(comp, curve):
+    """ln(p1 / channels at hour 1) for a donor, or None when the
+    hour-1 channels are unknown."""
+    day = (comp.get("day_start") or "")[:10]
+    first = day + "T00:00:00Z"
+    for row in comp.get("hourly") or []:
+        if row.get("from") == first:
+            ch = row.get("channels")
+            if ch:
+                return math.log(curve[1] / ch)
+            return None
+    return None
 
 
-def fit(donors: list, momenta: list, p1: float, f_target: float) -> dict:
-    """Per hour: (log-median-ratio, sigma) from the size + momentum fit.
-
-    Returns {hour: (lr, sigma)} where the median log ratio lr is
-    a_h + b_h * ln(p1) + c * s(h) * f, winsorised ln(p1), and sigma the
-    residual std times SIGMA_MULT. Hours with too few donors fall back to
-    the median log ratio over the donors. Donors without a momentum value
-    take the donors' median momentum.
-    """
-    xs_all = [math.log(c[1]) for c in donors]
-    lo, hi = min(xs_all), max(xs_all)
-    x = max(lo, min(hi, math.log(max(p1, 1))))
-    known = [m for m in momenta if m is not None]
-    med_f = median(known) if known else 0.0
-    feats = [m if m is not None else med_f for m in momenta]
-    f0 = f_target if f_target is not None else med_f
-    # Per-hour points: (ln p1, momentum, ln ratio).
-    per_hour = {}
-    for h in range(2, 25):
-        per_hour[h] = [(math.log(c[1]), feats[i], math.log(c[h] / c[1]))
-                       for i, c in enumerate(donors) if h in c]
-    scale = MOMENTUM_START
-    coefs = {}
-    for _ in range(MOMENTUM_ROUNDS):
-        # Given the scale: per-hour size regression on the adjusted ratios.
-        coefs = _fit_size_given_scale(per_hour, scale)
-        # Given the per-hour fits: one global momentum scale by least squares.
-        scale = _fit_scale(per_hour, coefs)
-    out = {}
-    for h in range(2, 25):
-        pts = per_hour[h]
-        if len(pts) < MIN_PER_HOUR:
-            lr = median([p[2] for p in pts]) if pts else 0.0
-            out[h] = (lr, 0.5)
-            continue
-        a, b = coefs[h]
-        res = [y - (a + b * xx + scale * momentum_shape(h) * f)
-               for xx, f, y in pts]
-        out[h] = (a + b * x + scale * momentum_shape(h) * f0,
-                  max(SIGMA_FLOOR, pstdev(res) * SIGMA_MULT))
-    return out
+def _round_half_up_2dp(v):
+    """JS Math.round(v * 100) / 100: round half up to 2 decimals."""
+    return math.floor(v * 100.0 + 0.5) / 100.0
 
 
-def quantile_row(p1: float, lr: float, sigma: float, z: float) -> float:
-    """One raw quantile value, before clamping and rounding."""
-    return p1 * math.exp(lr + z * sigma)
-
-
-def hour_quantiles(p1: float, lr: float, sigma: float) -> list:
-    """The five quantiles for one hour, non-decreasing, in (0, 1e9]."""
-    row = []
-    prev = 0.0
+def _quantile_row(h, lr, sigma, p1):
+    qs = []
+    prev = None
     for z in Z:
-        q = quantile_row(p1, lr, sigma, z)
-        q = max(q, prev)
-        q = min(q, 1e9)
-        q = round2(q)
-        if q <= 0:
+        q = p1 * math.exp(lr + z * sigma)
+        if q > 1e9:
+            q = 1e9
+        q = _round_half_up_2dp(q)
+        if q < 0.01:
             q = 0.01
-        if q < prev:
+        if prev is not None and q < prev:
             q = prev
-        row.append(q)
+        qs.append(q)
         prev = q
-    return row
+    return {"hour": h, "q": qs}
 
 
-def target_momentum(case: dict, p1: float) -> float | None:
-    """The target launch's early-wave momentum, from its own history.
+def _fit_ab(hour_data, c, g):
+    """Per-hour (a_h, b_h) with the current (c, g).
 
-    Prefers history_hourly; if that is absent, aggregates the minute
-    history points into hourly means first.
+    Regress the log-ratio net of the momentum and vpc1 effects on
+    ln(p1); clamp the slope to [-0.55, 0.05], then refit the intercept
+    as the mean residual after clamping. Hours with fewer than 5
+    donors are left out (they use the median fallback instead).
     """
-    hourly = case.get("history_hourly")
-    if not hourly:
-        buckets: dict = {}
-        for pt in case.get("history") or []:
-            key = hour_key(pt.get("at", ""))
-            viewers = pt.get("viewers")
-            if key is not None and viewers:
-                buckets.setdefault(key, []).append(viewers)
-        hourly = []
-        for key, vals in sorted(buckets.items()):
-            day = date.fromordinal(key // 24)
-            hourly.append({"from": f"{day.isoformat()}T{key % 24:02d}:00:00Z",
-                           "viewers": mean(vals)})
-    return window_feature(hourly, case.get("day_start", ""),
-                          case.get("checkpoint", ""), p1)
+    ab = {}
+    for h, pts in hour_data.items():
+        if len(pts) < 5:
+            continue
+        sh, uh = _s(h), _u(h)
+        xs = [x for (x, _y, _f, _va) in pts]
+        ys = [y - c * sh * f - g * uh * va for (x, y, f, va) in pts]
+        mx = sum(xs) / len(xs)
+        my = sum(ys) / len(ys)
+        var = sum((x - mx) ** 2 for x in xs)
+        if var > 0:
+            b = sum((x - mx) * (yy - my) for x, yy in zip(xs, ys)) / var
+        else:
+            b = 0.0
+        b = min(B_MAX, max(B_MIN, b))
+        a = sum(yy - b * x for x, yy in zip(xs, ys)) / len(xs)
+        ab[h] = (a, b)
+    return ab
 
 
-def forecast_case(case: dict, name: str) -> dict:
-    if case["levels"] != LEVELS:
-        raise ValueError(f"{name} asks for levels {case['levels']}, not {LEVELS}")
-    first = next((k for k in case["known"] if k["hour"] == 1), None)
-    if first is None:
-        raise ValueError(f"{name} has no hour-1 print")
-    p1 = max(1, first["viewers"])
+def _solve_cg(hour_data, ab):
+    """Joint 2x2 least squares for (c, g) from all residuals.
+
+    Residuals r = y - a_h - b_h * ln(p1); solve for c, g in
+    r ~= c * s(h) * f + g * u(h) * (vpc1 - med_vpc1). Singular
+    systems yield (0.0, 0.0).
+    """
+    ss = su = uu = sr = ur = 0.0
+    for h, pts in hour_data.items():
+        if h not in ab:
+            continue
+        a, b = ab[h]
+        sh, uh = _s(h), _u(h)
+        for (x, y, f, va) in pts:
+            r = y - a - b * x
+            st = sh * f
+            ut = uh * va
+            ss += st * st
+            su += st * ut
+            uu += ut * ut
+            sr += st * r
+            ur += ut * r
+    det = ss * uu - su * su
+    if abs(det) < 1e-12:
+        return 0.0, 0.0
+    c = (sr * uu - ur * su) / det
+    g = (ss * ur - su * sr) / det
+    return c, g
+
+
+def forecast_case(case, name):
+    """Forecast one case: {"hours": [{"hour": h, "q": [...]}]}."""
+    known = {r.get("hour"): r for r in case.get("known") or []}
+    k1 = known.get(1) or {}
+    p1 = float(k1.get("viewers") or 0) or 1.0
+    if p1 <= 0:
+        p1 = 1.0
+    channels1 = k1.get("channels")
+    rows = case.get("forecast") or []
+    hours = sorted(r["hour"] for r in rows if "hour" in r) or list(range(2, 25))
+
     donors = pick_donors(case)
     if not donors:
-        # No usable comparable at all: house persistence shape.
-        params = {h: (0.0, 0.15 * math.sqrt(h - 1)) for h in range(2, 25)}
+        # No donor at all: house-baseline shape (median = p1).
+        return {"hours": [_quantile_row(h, 0.0, 0.15 * math.sqrt(h - 1), p1)
+                          for h in hours]}
+
+    # Donor features: ln(p1), release-day curve, momentum, vpc1.
+    feats = []
+    for comp, curve in donors:
+        p1d = curve[1]
+        day_start = comp.get("day_start") or ""
+        cp = day_start[:10] + "T01:00:00Z"
+        drows = [(_ts_hour(r.get("from")), r.get("viewers"))
+                 for r in comp.get("hourly") or []]
+        f = _momentum(drows, day_start, cp, p1d)
+        vpc = _donor_vpc1(comp, curve)
+        feats.append([math.log(p1d), curve, f, vpc])
+    known_vpcs = [ft[3] for ft in feats if ft[3] is not None]
+    med_vpc = _median(known_vpcs) if known_vpcs else 0.0
+    known_fs = [ft[2] for ft in feats if ft[2] is not None]
+    med_f = _median(known_fs) if known_fs else 0.0
+    for ft in feats:
+        if ft[2] is None:
+            ft[2] = med_f
+        if ft[3] is None:
+            ft[3] = med_vpc
+
+    # Target features: momentum from history_hourly (or per-hour means
+    # of history when that is empty), vpc1 from the known hour-1 row.
+    hh = case.get("history_hourly") or []
+    if hh:
+        trows = [(_ts_hour(r.get("from")), r.get("viewers")) for r in hh]
     else:
-        curves = [curve for _, curve in donors]
-        momenta = [donor_momentum(comp, curve) for comp, curve in donors]
-        f_target = target_momentum(case, p1)
-        params = fit(curves, momenta, p1, f_target)
-    hours = []
-    for row in case["forecast"]:
-        h = row["hour"]
-        lr, sigma = params[h]
-        hours.append({"hour": h, "q": hour_quantiles(p1, lr, sigma)})
-    return {"hours": hours}
+        agg = {}
+        for r in case.get("history") or []:
+            idx = _ts_hour(r.get("at"))
+            if idx is not None and r.get("viewers") is not None:
+                agg.setdefault(idx, []).append(r["viewers"])
+        trows = [(idx, sum(vs) / len(vs)) for idx, vs in sorted(agg.items())]
+    f_t = _momentum(trows, case.get("day_start") or "",
+                    case.get("checkpoint") or "", p1)
+    if f_t is None:
+        f_t = med_f
+    if channels1:
+        vpc_t = math.log(p1 / channels1)
+    else:
+        vpc_t = med_vpc
+
+    # Winsorise the target's ln(p1) to the donors' ln(p1) range.
+    xs = [ft[0] for ft in feats]
+    ln_p1 = min(max(math.log(p1), min(xs)), max(xs))
+
+    # Per-hour donor points: (ln p1, log-ratio, f, vpc1 - med_vpc1).
+    hour_data = {}
+    for h in hours:
+        pts = []
+        for (x, curve, f, vpc) in feats:
+            if h in curve:
+                pts.append((x, math.log(curve[h] / curve[1]), f, vpc - med_vpc))
+        hour_data[h] = pts
+
+    # Alternating least squares for (c, g): 8 rounds from (0.5, 0.0).
+    c, g = C_INIT, G_INIT
+    ab = {}
+    for _ in range(ALS_ROUNDS):
+        ab = _fit_ab(hour_data, c, g)
+        c, g = _solve_cg(hour_data, ab)
+
+    out_hours = []
+    for h in hours:
+        pts = hour_data[h]
+        if len(pts) < 5:
+            lr = _median([y for (_x, y, _f, _va) in pts]) if pts else 0.0
+            sigma = 0.5
+        else:
+            a, b = ab[h]
+            sh, uh = _s(h), _u(h)
+            lr = a + b * ln_p1 + c * sh * f_t + g * uh * (vpc_t - med_vpc)
+            resid = [y - (a + b * x + c * sh * f + g * uh * va)
+                     for (x, y, f, va) in pts]
+            sigma = max(SIGMA_FLOOR, _pstdev(resid) * SIGMA_MULT)
+        out_hours.append(_quantile_row(h, lr, sigma, p1))
+    return {"hours": out_hours}
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    # Every case file, in name order, so two runs write the same bytes.
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case, path.name)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+def main():
+    in_dir = Path(os.environ.get("MAKEFUN_INPUT_DIR") or "/input")
+    out_dir = Path(os.environ.get("MAKEFUN_OUTPUT_DIR") or "/output")
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for path in sorted(in_dir.glob("*.in")):
+        case = json.loads(path.read_text())
+        out = forecast_case(case, path.stem)
+        (out_dir / (path.stem + ".out")).write_text(
+            json.dumps(out, separators=(",", ":")) + "\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
