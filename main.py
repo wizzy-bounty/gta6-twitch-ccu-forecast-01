@@ -255,10 +255,11 @@ def _fit(donors):
 def _predict(model, x, f, vpc):
     out = {}
     for h in model["hours"]:
+        u = _u(h)
         v = model["a"][h] + model["b"][h] * (x - model["med_x"])
         v += model["c"] * f
-        v += model["g"] * _u(h) * (vpc - model["med_vpc"])
-        v += model["e"] * _u(h) * f * (x - model["med_x"])
+        v += model["g"] * u * (vpc - model["med_vpc"])
+        v += model["e"] * u * f * (x - model["med_x"])
         out[h] = v
     return out
 
